@@ -1,7 +1,7 @@
 ﻿function Publish-SSRSProject{
 	#requires -version 2.0
-	# https://github.com/timabell/ssrs-powershell-deploy
 	[CmdletBinding()]
+	# https://github.com/pauwertools/ssrs-powershell-deploy
 	param (
 		[parameter(Mandatory=$true)]
 		[ValidatePattern('\.rptproj$')]
@@ -47,7 +47,6 @@
 		$Credential
 	)
 
-
 	$script:ErrorActionPreference = 'Stop'
 	Set-StrictMode -Version Latest
 
@@ -55,9 +54,15 @@
 	$ProjectRoot = $Path | Split-Path
 	[xml]$Project = Get-Content -Path $Path
 
+	$nsMgr = New-Object System.Xml.XmlNamespaceManager($Project.NameTable)
+	$nsMgr.AddNamespace("ns", "http://schemas.microsoft.com/developer/msbuild/2003")
 
+	# Select the nodes under Project/ItemGroup/Report using the registered namespace
+	$reports = $Project.SelectNodes("//ns:Project/ns:ItemGroup/ns:Report", $nsMgr)
+  	$datasets = $Project.SelectNodes("//ns:Project/ns:ItemGroup/ns:DataSet", $nsMgr)
+  	$datasources = $Project.SelectNodes("//ns:Project/ns:ItemGroup/ns:DataSource", $nsMgr)
 
-	#Argument validation
+	#TBD: Configuration param not working
 	if(![string]::IsNullOrEmpty($Configuration))
 	{
 		$Config = Get-SSRSProjectConfiguration -Path $Path -Configuration $Configuration
@@ -103,28 +108,25 @@
 			Write-Verbose "Using Project OverwriteDatasets: $($Config.OverwriteDatasets)"
 			$OverwriteDatasets = $Config.OverwriteDatasets
 		}
-
-
 	}
 
-	$Project.SelectNodes('Project/Reports/ProjectItem') |
-		ForEach-Object {
-			$CompiledRdlPath = $ProjectRoot | Join-Path -ChildPath $OutputPath | join-path -ChildPath $_.FullPath
-			$RdlPath = $ProjectRoot | join-path -ChildPath $_.FullPath
-		
-			if ((test-path $CompiledRdlPath) -eq $false)
-			{
-				write-error ('Report "{0}" is listed in the project but wasn''t found in the bin\ folder. Rebuild your project before publishing.' -f $CompiledRdlPath)
-				break;
-			}
-			$RdlLastModified = (get-item $RdlPath).LastWriteTime
-			$CompiledRdlLastModified = (get-item $CompiledRdlPath).LastWriteTime
-			if ($RdlLastModified -gt $CompiledRdlLastModified)
-			{
-				write-error ('Report "{0}" in bin\ is older than source file "{1}". Rebuild your project before publishing.' -f $CompiledRdlPath,$RdlPath)
-				break;
-			}
-		}
+	$reports | ForEach-Object {
+        $CompiledRdlPath = $ProjectRoot | Join-Path -ChildPath $OutputPath | join-path -ChildPath $_.Include
+        $RdlPath = $ProjectRoot | join-path -ChildPath $_.Include
+        Write-Host $RdlPath
+        if ((test-path $CompiledRdlPath) -eq $false)
+        {
+          write-error ('Report "{0}" is listed in the project but wasn''t found in the bin\ folder. Rebuild your project before publishing.' -f $CompiledRdlPath)
+          break;
+        }
+        $RdlLastModified = (get-item $RdlPath).LastWriteTime
+        $CompiledRdlLastModified = (get-item $CompiledRdlPath).LastWriteTime
+        if ($RdlLastModified -gt $CompiledRdlLastModified)
+        {
+          write-error ('Report "{0}" in bin\ is older than source file "{1}". Rebuild your project before publishing.' -f $CompiledRdlPath,$RdlPath)
+          break;
+        }
+      }
 
 
 	$Folder = Normalize-SSRSFolder -Folder $Folder
@@ -139,18 +141,18 @@
 	New-SSRSFolder -Proxy $Proxy -Name $DataSourceFolder
 	New-SSRSFolder -Proxy $Proxy -Name $DataSetFolder
 
-	$DataSourcePaths = @{}
-	for($i = 0; $i -lt $Project.Project.ItemGroup[0].DataSource.Count; $i++) {
-		$RdsPath = $ProjectRoot | Join-Path -ChildPath $Project.Project.ItemGroup[0].DataSource[$i].Include
+  $DataSourcePaths = @{}
+  for($i = 0; $i -lt $datasources.Count; $i++) {
+    $RdsPath = $ProjectRoot | Join-Path -ChildPath $datasources[$i].Include
 
-		$DataSource = New-SSRSDataSource -Proxy $Proxy -RdsPath $RdsPath -Folder $DataSourceFolder -Overwrite $OverwriteDataSources
-		$DataSourcePaths.Add($DataSource.Name, $DataSource.Path)
-	}
+    $DataSource = New-SSRSDataSource -Proxy $Proxy -RdsPath $RdsPath -Folder $DataSourceFolder -Overwrite $OverwriteDataSources
+    $DataSourcePaths.Add($DataSource.Name, $DataSource.Path)
+  }
 
 	$DataSetPaths = @{}
-	$Project.SelectNodes('Project/DataSets/ProjectItem') |
+	$datasets |
 		ForEach-Object {
-			$RsdPath = $ProjectRoot | Join-Path -ChildPath $_.FullPath
+			$RsdPath = $ProjectRoot | Join-Path -ChildPath $_.Include
 			$DataSet = New-SSRSDataSet -Proxy $Proxy -RsdPath $RsdPath -Folder $DataSetFolder -DataSourcePaths $DataSourcePaths -Overwrite $OverwriteDatasets
 			if(-not $DataSetPaths.Contains($DataSet.Name))
 			{
@@ -158,13 +160,13 @@
 			}
 		}
 
-	for($i = 0; $i -lt $Project.Project.ItemGroup[1].Report.Count; $i++) {
+	for($i = 0; $i -lt $reports.Count; $i++) {
 
-            $extension = $Project.Project.ItemGroup[1].Report[$i].Include.Substring($Project.Project.ItemGroup[1].Report[$i].Include.length - 3 , 3)
+            $extension = $reports[$i].Include.Substring($reports[$i].Include.length - 3 , 3)
 
 			if(ImageExtensionValid -ext $extension){
 
-				$PathImage = $ProjectRoot | Join-Path -ChildPath $Project.Project.ItemGroup[1].Report[$i].Include
+				$PathImage = $ProjectRoot | Join-Path -ChildPath $reports[$i].Include
 				$RawDefinition = Get-Content -Encoding Byte -Path $PathImage
 
 				$DescProp = New-Object -TypeName SSRS.ReportingService2010.Property
@@ -179,20 +181,23 @@
 
 				$Properties = @($DescProp, $HiddenProp, $MimeProp)
 
-				$Name = $Project.Project.ItemGroup[1].Report[$i].Include
+				$Name = $reports[$i].Include
 				Write-Verbose "Creating resource $Name"
 				$warnings = $null
 				$Results = $Proxy.CreateCatalogItem("Resource", $Project.Project.ItemGroup[1].Report[$i].Include, $Folder, $true, $RawDefinition, $Properties, [ref]$warnings)
 			}
 		}
-
-	for($i = 0; $i -lt $Project.Project.ItemGroup[1].Report.Count; $i++) {
-        if($Project.Project.ItemGroup[1].Report[$i].Include.EndsWith('.rdl')){
-			$CompiledRdlPath = $ProjectRoot | Join-Path -ChildPath $OutputPath | join-path -ChildPath $Project.Project.ItemGroup[1].Report[$i].Include
-			New-SSRSReport -Proxy $Proxy -RdlPath $CompiledRdlPath -RdlName $Project.Project.ItemGroup[1].Report[$i].Include
-        }
-	}
-
+  try {
+    for($i = 0; $i -lt $reports.Count; $i++) {
+      if($reports[$i].Include.EndsWith('.rdl')){
+        $CompiledRdlPath = $ProjectRoot | Join-Path -ChildPath $OutputPath | join-path -ChildPath $reports[$i].Include
+        New-SSRSReport -Proxy $Proxy -RdlPath $CompiledRdlPath -RdlName $reports[$i].Include
+      }
+  }
+  }
+  catch {
+    Write-Host "Failed to publish report: $($_.Exception.Message)" -ForegroundColor Red
+  }
 	Write-host "Completed."
 }
 
